@@ -4,7 +4,7 @@
 #  Build / run         make app | make run | make daemon | make status | make stop | make debug
 #  Testing             make coverage   (GTest unit + integration, coverage table)
 #                      make cunit      (CUnit runner, output -> cunit_report.txt)
-#  Memory              make valgrind   (supervisor runs 20 s with the sample config -> valgrind_report.txt)
+#  Memory              make valgrind   (parent + child under Valgrind, leak owner per PID -> valgrind_report.txt)
 #                      make valgrind-tests (all GTest cases -> valgrind_tests_report.txt)
 #  Secure coding       make misra      (strict GCC diagnostics, must be 0 warnings)
 #                      make cppcheck   (-> cppcheck_report.txt, must be empty)
@@ -115,17 +115,40 @@ cppcheck:
 	@echo "==> CPPCheck Complete. Output logged to cppcheck_report.txt."
 
 # ---------------------------------------------------------- 6. Valgrind
-#    the supervisor runs the sample configuration (crashes, a hang and
-#    restarts happen during the run) and is then stopped with SIGTERM
-valgrind: app
-	@echo "==> Running Valgrind Dynamic Memory Analysis (20 s)..."
-	-timeout -s TERM 20 valgrind --leak-check=full \
-	         --show-leak-kinds=all \
-	         --track-origins=yes \
-	         --track-fds=yes \
-	         --log-file=valgrind_report.txt \
-	         ./supervisor -c supervisor.conf > /dev/null
+#    IPC application = the supervisor (parent) + the service it forks and
+#    execs (child); they talk over the heartbeat pipe. Both are built with
+#    -DLEAK_DEMO: the parent leaks 128 bytes, the child leaks 64 bytes.
+#    --trace-children=yes makes Valgrind follow the child through
+#    fork() + execvp(), so each process gets its own report tagged ==PID==.
+ipc_application: $(SRCS) $(DEMO).c
+	$(CC) $(CFLAGS) -g -O0 -DLEAK_DEMO $(SRCS) -o ipc_application
+	$(CC) -std=c99 -D_DEFAULT_SOURCE -Wall -Wextra -g -O0 -DLEAK_DEMO $(DEMO).c -o $(DEMO)_leak
+
+valgrind: ipc_application
+	@echo "==> Running the IPC application under Valgrind for 15 s, then SIGTERM..."
+	-timeout -s TERM 15 \
+	valgrind \
+	    --trace-children=yes \
+	    --leak-check=full \
+	    ./ipc_application -c debug/valgrind.conf > /dev/null 2> valgrind_report.txt
 	@cat valgrind_report.txt
+	@echo "========================================================================"
+	@echo "                  LEAK OWNERSHIP (one row per process)                  "
+	@echo "========================================================================"
+	@parent=$$(sed -n 's/^==\([0-9]*\)== Command:.*/\1/p' valgrind_report.txt | head -n 1); \
+	printf "%-7s %-7s %-45s %s\n" "PID" "ROLE" "PROGRAM" "DEFINITELY LOST"; \
+	for p in $$(sed -n 's/^==\([0-9]*\)== Command:.*/\1/p' valgrind_report.txt); do \
+	    if [ "$$p" = "$$parent" ]; then role=PARENT; else role=CHILD; fi; \
+	    printf "%-7s %-7s %-45s %s\n" "$$p" "$$role" \
+	        "$$(sed -n "s/^==$$p== Command: //p" valgrind_report.txt)" \
+	        "$$(sed -n "s/^==$$p==    definitely lost: //p" valgrind_report.txt)"; \
+	done
+	@echo "------------------------------------------------------------------------"
+	@echo "Where each leak was allocated (same ==PID== as the row above):"
+	@grep -E "definitely lost in loss record|by 0x.*(parentLeakDemo|childLeakDemo)" valgrind_report.txt
+	@echo "------------------------------------------------------------------------"
+	@echo "Parent -> child link (written by the parent in supervisor.log):"
+	@grep "I002 service started" supervisor.log | tail -n 1
 
 #    non-interactive: every GTest case under Valgrind
 valgrind-tests: coverage
@@ -225,7 +248,7 @@ all-checks: app misra cppcheck coverage cunit valgrind-tests optimize crash-stor
 
 # ------------------------------------------------------------ 11. clean
 clean:
-	rm -rf supervisor supervisor_debug $(DEMO) test_runner cunit_runner *.o *.gcno *.gcda *.info *.gcov asm gdb_run \
+	rm -rf supervisor supervisor_debug ipc_application $(DEMO) $(DEMO)_leak test_runner cunit_runner *.o *.gcno *.gcda *.info *.gcov asm gdb_run \
 	       bin_crash_storm bin_process_performance \
 	       bin_fault_null bin_fault_overflow bin_fault_logic bin_fault_doublefree bin_fixed_* \
 	       cppcheck_report.txt valgrind_report.txt valgrind_tests_report.txt cunit_report.txt \
