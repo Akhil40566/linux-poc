@@ -1,6 +1,7 @@
 # =====================================================================
 # ADAS ECU Process Supervisor (Mini "init") - build, test and quality gates
 #
+#  Setup (once)        make setup      (installs GoogleTest, CUnit, lcov, cppcheck, Valgrind, GDB)
 #  Build / run         make app | make run | make daemon | make status | make stop | make debug
 #  Testing             make coverage   (GTest unit + integration, coverage table)
 #                      make cunit      (CUnit runner, output -> cunit_report.txt)
@@ -11,6 +12,9 @@
 #  Optimization        make optimize   (.s size at -O0..-O3 -> optimization_report.txt)
 #  Multiprocessing     make crash-storm      (20 services crash at the same moment: no zombies)
 #                      make process-performance (crash detection and restart latency)
+#  Multithreading      make helgrind-race-buggy | helgrind-race-fixed
+#                      make helgrind-deadlock-buggy | helgrind-deadlock-fixed
+#                      make helgrind-supervisor (real supervisor under Helgrind, Expected 0 errors)
 #  Debugging (GDB)     make gdb-null | gdb-overflow | gdb-logic | gdb-doublefree
 #                      make gdb-inject-fork | gdb-inject-file
 #                      make valgrind-doublefree | make faults-fixed
@@ -26,6 +30,7 @@ COVERAGE_FLAGS := -O0 -g --coverage -Iinclude
 LDFLAGS        := -lgtest -lgtest_main -pthread --coverage
 DEBUG_FLAGS    := -std=c99 -D_DEFAULT_SOURCE -Wall -Wextra -g -O0 -Iinclude
 PROC_FLAGS     := -std=c99 -D_DEFAULT_SOURCE -Wall -Wextra -g -Iinclude
+THREAD_FLAGS   := -std=c99 -D_DEFAULT_SOURCE -Wall -Wextra -g -pthread -Iinclude
 
 # Source definitions
 SRCS           := $(wildcard src/*.c)
@@ -42,12 +47,20 @@ else
 LCOV_OPTS      := --rc lcov_branch_coverage=1
 endif
 
-.PHONY: all app run daemon status stop debug coverage cunit misra cppcheck valgrind valgrind-tests \
+.PHONY: all setup app run daemon status stop debug coverage cunit misra cppcheck valgrind valgrind-tests \
         optimize crash-storm process-performance \
+        helgrind-race-buggy helgrind-race-fixed helgrind-deadlock-buggy helgrind-deadlock-fixed helgrind-supervisor \
         gdb-null gdb-overflow gdb-logic gdb-doublefree gdb-inject-fork gdb-inject-file \
         valgrind-doublefree faults-fixed all-checks clean
 
 all: app
+
+# ------------------------------------------------- 0. one-time setup
+#    Ubuntu / Debian (GitHub Codespaces): the libraries and tools the
+#    test, analysis and debug targets need
+setup:
+	sudo apt-get update
+	sudo apt-get install -y build-essential libgtest-dev libcunit1-dev lcov cppcheck valgrind gdb
 
 # ---------------------------------------------------------------- 1. build
 #    the demo ADAS service is needed by the sample configuration and the tests
@@ -77,6 +90,8 @@ debug: $(DEMO)
 # ---------------------------------------------------- 2. GTest + coverage
 #    modules and the shim are compiled as C, the test file as C++
 coverage: $(DEMO)
+	@echo '#include <gtest/gtest.h>' | $(CXX) -E -x c++ - > /dev/null 2>&1 || \
+	    { echo "ERROR: GoogleTest is not installed. Run: make setup"; exit 1; }
 	@echo "==> Compiling Unit Tests with Coverage Instrumentation..."
 	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -c $(MODULES) tests/test_shim.c
 	$(CXX) $(COVERAGE_FLAGS) $(OBJS) tests/test_supervisor.cpp $(LDFLAGS) -o test_runner
@@ -95,6 +110,8 @@ coverage: $(DEMO)
 
 # ------------------------------------------------------------- 3. CUnit
 cunit: $(DEMO)
+	@echo '#include <CUnit/Basic.h>' | $(CC) -E -x c - > /dev/null 2>&1 || \
+	    { echo "ERROR: CUnit is not installed. Run: make setup"; exit 1; }
 	$(CC) $(CFLAGS) -Wall -Wextra -g $(MODULES) tests/test_shim.c tests/cunit/test_cunit.c -lcunit -o cunit_runner
 	./cunit_runner | tee cunit_report.txt
 
@@ -107,10 +124,11 @@ misra:
 # ---------------------------------------------------------- 5. CPPCheck
 #    staticFunction / unusedFunction are suppressed: the module interface
 #    functions (LLD 6.2) are public on purpose and are called by the tests.
+#    unmatchedSuppression: older cppcheck versions do not know staticFunction.
 cppcheck:
 	@echo "==> Running CPPCheck Static Analysis..."
 	cppcheck --enable=all --check-level=exhaustive --inline-suppr --suppress=missingIncludeSystem --suppress=checkersReport \
-	         --suppress=staticFunction --suppress=unusedFunction --std=c99 -Iinclude src/ 2> cppcheck_report.txt
+	         --suppress=staticFunction --suppress=unusedFunction --suppress=unmatchedSuppression --std=c99 -Iinclude src/ 2> cppcheck_report.txt
 	@cat cppcheck_report.txt
 	@echo "==> CPPCheck Complete. Output logged to cppcheck_report.txt."
 
@@ -126,11 +144,13 @@ ipc_application: $(SRCS) $(DEMO).c
 
 valgrind: ipc_application
 	@echo "==> Running the IPC application under Valgrind for 15 s, then SIGTERM..."
-	-timeout -s TERM 15 \
+	@echo "    (EXPECTED: one leak in the parent and one in the child, both deliberate: -DLEAK_DEMO)"
+	timeout -s TERM 15 \
 	valgrind \
 	    --trace-children=yes \
 	    --leak-check=full \
-	    ./ipc_application -c debug/valgrind.conf > /dev/null 2> valgrind_report.txt
+	    ./ipc_application -c debug/valgrind.conf > /dev/null 2> valgrind_report.txt; \
+	status=$$?; [ $$status -eq 124 ] || [ $$status -eq 0 ]
 	@cat valgrind_report.txt
 	@echo "========================================================================"
 	@echo "                  LEAK OWNERSHIP (one row per process)                  "
@@ -197,6 +217,49 @@ process-performance: bin_process_performance
 	@echo "==> Measuring crash detection, restart and heartbeat-loss latency..."
 	./bin_process_performance
 
+# ---------------------------------------- 8b. Multithreading (Helgrind)
+#    LLD 9.1 Alternative 1 (one monitor thread per service) was rejected.
+#    These demos show the data race and the lock-order deadlock it would
+#    bring; helgrind-supervisor proves the real, single-threaded supervisor
+#    has 0 thread errors.
+bin_race_buggy: $(CONCURRENCY)/test_thread_race.c $(MODULES)
+	$(CC) $(THREAD_FLAGS) $(MODULES) $< -o $@
+
+bin_race_fixed: $(CONCURRENCY)/test_thread_race.c $(MODULES)
+	$(CC) $(THREAD_FLAGS) -DUSE_MUTEX $(MODULES) $< -o $@
+
+bin_deadlock_buggy: $(CONCURRENCY)/test_deadlock.c
+	$(CC) $(THREAD_FLAGS) $< -o $@
+
+bin_deadlock_fixed: $(CONCURRENCY)/test_deadlock.c
+	$(CC) $(THREAD_FLAGS) -DFIX_DEADLOCK $< -o $@
+
+helgrind-race-buggy: bin_race_buggy
+	@echo "==> Native run, threads truly in parallel (Expected: updates lost):"
+	-./bin_race_buggy
+	@echo "==> Helgrind: 4 monitor threads update one service with NO lock (Expected: data race reported)..."
+	@echo "    (Helgrind runs threads one at a time, so the count may look correct here; the race is still reported)"
+	-valgrind --tool=helgrind ./bin_race_buggy
+
+helgrind-race-fixed: bin_race_fixed
+	@echo "==> Helgrind: 4 monitor threads update one service WITH a table mutex (Expected 0 errors)..."
+	valgrind --tool=helgrind --error-exitcode=1 ./bin_race_fixed
+
+helgrind-deadlock-buggy: bin_deadlock_buggy
+	@echo "==> Helgrind: monitor takes table->log, dashboard takes log->table (Expected: lock order violated)..."
+	-valgrind --tool=helgrind ./bin_deadlock_buggy
+
+helgrind-deadlock-fixed: bin_deadlock_fixed
+	@echo "==> Helgrind: both threads take table->log (Expected 0 errors)..."
+	valgrind --tool=helgrind --error-exitcode=1 ./bin_deadlock_fixed
+
+helgrind-supervisor: app
+	@echo "==> Helgrind on the real supervisor for 12 s with supervisor.conf (single-threaded, Expected 0 errors)..."
+	timeout -s TERM 12 valgrind --tool=helgrind ./supervisor -c supervisor.conf > /dev/null 2> helgrind_report.txt; \
+	status=$$?; [ $$status -eq 124 ] || [ $$status -eq 0 ]
+	@cat helgrind_report.txt
+	@grep -q "ERROR SUMMARY: 0 errors" helgrind_report.txt && echo "==> Helgrind PASSED: 0 thread errors."
+
 # ------------------------------------------- 9. GDB and fault injection
 bin_fault_null: debug/fault_null_pointer.c $(MODULES)
 	$(CC) $(DEBUG_FLAGS) $(MODULES) $< -o $@
@@ -223,6 +286,9 @@ gdb-doublefree: bin_fault_doublefree
 	-gdb -q -batch -x debug/gdb_double_free.gdb ./bin_fault_doublefree
 
 valgrind-doublefree: bin_fault_doublefree
+	@echo "==> Valgrind on debug/fault_double_free.c: a DELIBERATE double free (fault-injection demo)."
+	@echo "    EXPECTED: 'Invalid read' and 'Invalid free()' pointing at fault_double_free.c:28 and ptFree()."
+	@echo "    The fixed version runs clean: make faults-fixed"
 	-valgrind --leak-check=full ./bin_fault_doublefree
 
 #    fault injection into the real program (runs in a scratch folder gdb_run/)
@@ -244,12 +310,13 @@ faults-fixed:
 	done
 
 # ------------------------------------------------------- 10. everything
-all-checks: app misra cppcheck coverage cunit valgrind-tests optimize crash-storm process-performance faults-fixed
+all-checks: app misra cppcheck coverage cunit valgrind-tests optimize crash-storm process-performance \
+            helgrind-race-fixed helgrind-deadlock-fixed helgrind-supervisor faults-fixed
 
 # ------------------------------------------------------------ 11. clean
 clean:
 	rm -rf supervisor supervisor_debug ipc_application $(DEMO) $(DEMO)_leak test_runner cunit_runner *.o *.gcno *.gcda *.info *.gcov asm gdb_run \
-	       bin_crash_storm bin_process_performance \
+	       bin_crash_storm bin_process_performance bin_race_buggy bin_race_fixed bin_deadlock_buggy bin_deadlock_fixed \
 	       bin_fault_null bin_fault_overflow bin_fault_logic bin_fault_doublefree bin_fixed_* \
-	       cppcheck_report.txt valgrind_report.txt valgrind_tests_report.txt cunit_report.txt \
+	       cppcheck_report.txt valgrind_report.txt valgrind_tests_report.txt cunit_report.txt helgrind_report.txt \
 	       optimization_report.txt supervisor.log supervisor.log.1 supervisor.pid supervisor.status
