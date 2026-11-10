@@ -5,7 +5,8 @@
 #  Build / run         make app | make run | make daemon | make status | make stop | make debug
 #  Testing             make coverage   (GTest unit + integration, coverage table)
 #                      make cunit      (CUnit runner, output -> cunit_report.txt)
-#  Memory              make valgrind   (parent + child under Valgrind, leak owner per PID -> valgrind_report.txt)
+#  Memory              make valgrind   (intentional parent + child leaks -> valgrind_report.txt)
+#                      make valgrind-clean (normal build, clean run -> valgrind_clean_report.txt)
 #                      make valgrind-tests (all GTest cases -> valgrind_tests_report.txt)
 #  Secure coding       make misra      (strict GCC diagnostics, must be 0 warnings)
 #                      make cppcheck   (-> cppcheck_report.txt, must be empty)
@@ -47,7 +48,7 @@ else
 LCOV_OPTS      := --rc lcov_branch_coverage=1
 endif
 
-.PHONY: all setup app run daemon status stop debug coverage cunit misra cppcheck valgrind valgrind-tests \
+.PHONY: all setup app run daemon status stop debug coverage cunit misra cppcheck valgrind valgrind-clean valgrind-tests \
         optimize crash-storm process-performance \
         helgrind-race-buggy helgrind-race-fixed helgrind-deadlock-buggy helgrind-deadlock-fixed helgrind-supervisor \
         gdb-null gdb-overflow gdb-logic gdb-doublefree gdb-inject-fork gdb-inject-file \
@@ -170,10 +171,33 @@ valgrind: ipc_application
 	@echo "Parent -> child link (written by the parent in supervisor.log):"
 	@grep "I002 service started" supervisor.log | tail -n 1
 
+
+#    Run the normal, non-LEAK_DEMO build and fail if any process reports errors.
+valgrind-clean: app debug/valgrind_clean.conf
+	@echo "==> Running the normal IPC application under Valgrind for 15 s..."
+	@timeout -s TERM 15 valgrind \
+		--trace-children=yes \
+		--leak-check=full \
+		--show-leak-kinds=all \
+		--error-exitcode=1 \
+		./supervisor -c debug/valgrind_clean.conf > /dev/null 2> valgrind_clean_report.txt; \
+	status=$$?; \
+	if [ $$status -ne 124 ] && [ $$status -ne 0 ]; then \
+		cat valgrind_clean_report.txt; exit $$status; \
+	fi
+	@cat valgrind_clean_report.txt
+	@if ! grep -q 'ERROR SUMMARY:' valgrind_clean_report.txt; then \
+		echo "ERROR: Valgrind did not produce an error summary."; exit 1; \
+	fi
+	@if grep -Eq 'ERROR SUMMARY: [1-9][0-9]* errors' valgrind_clean_report.txt; then \
+		echo "ERROR: Valgrind found memory errors; see valgrind_clean_report.txt."; exit 1; \
+	fi
+	@echo "==> Valgrind clean run passed. Report: valgrind_clean_report.txt"
 #    non-interactive: every GTest case under Valgrind
 valgrind-tests: coverage
 	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --error-exitcode=1 \
-	         --log-file=valgrind_tests_report.txt ./test_runner > /dev/null
+	         --log-file=valgrind_tests_report.txt ./test_runner \
+> valgrind_gtest_output.txt 2>&1
 	@tail -n 12 valgrind_tests_report.txt
 
 # ------------------------------------------------------ 7. Optimization
